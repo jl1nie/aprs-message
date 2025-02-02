@@ -32,13 +32,14 @@ struct MsgHist {
     addressee: String,
     acknum: i32,
 }
+#[derive(Clone)]
 pub struct AprsIS {
     acknum: Arc<Mutex<i32>>,
     ackpool: Arc<Mutex<Vec<MsgHist>>>,
-    rx: mpsc::Receiver<AprsData>,
+    rx: Arc<Mutex<mpsc::Receiver<AprsData>>>,
     sender: String,
     writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
-    _handle: JoinHandle<Result<(), Error>>,
+    _handle: Arc<JoinHandle<Result<(), Error>>>,
 }
 
 impl AprsIS {
@@ -82,9 +83,10 @@ impl AprsIS {
 
                 let writer = Arc::new(Mutex::new(writer));
                 let writer_thread = writer.clone();
-                let _handle = tokio::spawn(async move {
+                let rx = Arc::new(Mutex::new(rx));
+                let _handle = Arc::new(tokio::spawn(async move {
                     AprsIS::run(&sender, reader, &writer_thread, &ackpool_thread, tx).await
-                });
+                }));
 
                 return Ok(Self {
                     acknum,
@@ -99,7 +101,7 @@ impl AprsIS {
         bail!("login error")
     }
 
-    async fn add_ack(
+    async fn store_ack(
         ackpool: &Arc<Mutex<Vec<MsgHist>>>,
         addressee: &str,
         acknum: i32,
@@ -223,7 +225,8 @@ impl AprsIS {
     }
 
     pub async fn read_packet(&mut self) -> Result<AprsData> {
-        if let Some(packet) = self.rx.recv().await {
+        let mut rx = self.rx.lock().await;
+        if let Some(packet) = rx.recv().await {
             Ok(packet)
         } else {
             bail!("packet read error")
@@ -308,7 +311,7 @@ impl AprsIS {
                                             .and_then(|c| c.get(1))
                                             .and_then(|m| m.as_str().parse::<i32>().ok())
                                         {
-                                            AprsIS::add_ack(ackpool, &from_call, acknum).await?;
+                                            AprsIS::store_ack(ackpool, &from_call, acknum).await?;
                                             continue;
                                         }
                                         if let Some(id) = id.clone() {
@@ -382,7 +385,7 @@ mod tests {
 
         let _ = server
             .write_message(
-                "JL1NIE-7".to_string(),
+                "JL1NIE-5".to_string(),
                 "Hello World, APRS messaging test.".to_string(),
             )
             .await;
