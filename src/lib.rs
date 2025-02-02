@@ -158,18 +158,18 @@ impl AprsIS {
         Ok(())
     }
 
-    pub async fn set_filter(&mut self, filter: String) -> Result<()> {
+    pub async fn set_filter(&self, filter: String) -> Result<()> {
         let buf = format!("#filter {}", filter);
         AprsIS::send_all(&self.writer, buf).await?;
         Ok(())
     }
 
-    pub async fn set_prefix_filter(&mut self, prefix: Vec<String>) -> Result<()> {
+    pub async fn set_prefix_filter(&self, prefix: Vec<String>) -> Result<()> {
         let filter = prefix.join("/");
         self.set_filter(format!("p/{}", filter)).await
     }
 
-    pub async fn set_budlist_filter(&mut self, buddy: Vec<String>) -> Result<()> {
+    pub async fn set_budlist_filter(&self, buddy: Vec<String>) -> Result<()> {
         let filter = buddy.join("/");
         self.set_filter(format!("b/{}", filter)).await
     }
@@ -224,7 +224,7 @@ impl AprsIS {
         Ok(())
     }
 
-    pub async fn read_packet(&mut self) -> Result<AprsData> {
+    pub async fn read_packet(&self) -> Result<AprsData> {
         let mut rx = self.rx.lock().await;
         if let Some(packet) = rx.recv().await {
             Ok(packet)
@@ -369,7 +369,7 @@ mod tests {
         let aprshost = env::var("APRSHOST").unwrap();
         let aprsuser = env::var("APRSUSER").unwrap();
         let aprspasword = env::var("APRSPASSWORD").unwrap();
-        let mut server = AprsIS::connect(&aprshost, &aprsuser, &aprspasword)
+        let server = AprsIS::connect(&aprshost, &aprsuser, &aprspasword)
             .await
             .expect("Can not connect server");
 
