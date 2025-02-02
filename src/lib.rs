@@ -1,95 +1,164 @@
-use std::collections::HashMap;
+use anyhow::{bail, Error, Result};
+use regex::Regex;
 use std::sync::Arc;
-use anyhow::{bail, Result};
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::tcp::{OwnedWriteHalf,OwnedReadHalf};
-use tokio::sync::{mpsc,Mutex};
-use tokio::net::TcpStream;
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpStream,
+};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tracing::{span, Level};
 
-pub use aprs_parser::{self, AprsData, AprsMessage, AprsMicE, AprsPacket, AprsPosition, Callsign, Longitude, Latitude};
+#[derive(Debug)]
+pub enum AprsData {
+    AprsPosition {
+        callsign: String,
+        longitude: f64,
+        latitude: f64,
+    },
+    AprsMesasge {
+        callsign: String,
+        addressee: String,
+        message: String,
+    },
+}
 
+#[derive(Debug)]
+struct MsgHist {
+    time: SystemTime,
+    addressee: String,
+    acknum: i32,
+}
 pub struct AprsIS {
-    acks: Arc<Mutex<HashMap<String, String>>>,
-    tx: mpsc::Sender<AprsData>,
+    acknum: Arc<Mutex<i32>>,
+    ackpool: Arc<Mutex<Vec<MsgHist>>>,
     rx: mpsc::Receiver<AprsData>,
+    sender: String,
     writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
-    reader: Arc<Mutex<BufReader<OwnedReadHalf>>>,
+    _handle: JoinHandle<Result<(), Error>>,
 }
 
 impl AprsIS {
-    pub async fn connect(host: &str) -> Result<Self> {
+    pub async fn connect(host: &str, callsign: &str, password: &str) -> Result<Self> {
         let span = span!(Level::INFO, "AprsIS");
         let _enter = span.enter();
 
         let stream = TcpStream::connect(host).await?;
-        let (rh, wh ) = stream.into_split();
-        let reader = Arc::new(Mutex::new(BufReader::new(rh)));
-        let writer = Arc::new(Mutex::new(BufWriter::new(wh)));
+        let (rh, wh) = stream.into_split();
+        let mut reader = BufReader::new(rh);
+        let mut writer = BufWriter::new(wh);
+
         let mut buf = String::new();
-        tracing::info!("connected to {}", host);
-        
-        let chk   = reader.clone();
-        let mut chk = chk.lock().await;
-        let n = chk.read_line(&mut buf).await?;
-        tracing::info!("read {} bytes {:?}", n, buf);
-        
+        let n = reader.read_line(&mut buf).await?;
+
+        tracing::info!("connect to {} read {} bytes {:?}", host, n, buf);
         if n == 0 || !buf.starts_with("#") {
-            bail!("Invalid bannder from server");
+            bail!("Invalid bannder from server")
         }
         tracing::info!("succesfully connected");
-        let (tx, rx) = mpsc::channel(32);
-        Ok(Self {
-            acks : Arc::new(Mutex::new(HashMap::new())),
-            tx,
-            rx,
-            reader,
-            writer
-        })
-    }
-    
-    async fn read_message(&self, message :&mut String) -> Result<usize> {
-        let mut reader = self.reader.lock().await;
-        let n = reader.read_line(message).await?;
-        Ok(n)
-    }
-    
-    async fn write_message(&self, message: String) -> Result<()> {
-        let mut writer = self.writer.lock().await;
-        writer.write_all(message.as_bytes()).await?;
+
+        let login_str = format!(
+            "user {} pass {} vers aprs_inet 0.0_1\r\n",
+            callsign, password
+        );
+        writer.write_all(login_str.as_bytes()).await?;
         writer.flush().await?;
-        Ok(())
-    }
 
-    async fn send_all(&mut self, buf: String) -> Result<()> {
-        let buf = buf.trim_end_matches(&['\r', '\n'][..]).to_string() + "\r\n";
-        self.write_message(buf).await?;
-        Ok(())
-    }
-
-    pub async fn login(&mut self, callsign: &str, password: &str) -> Result<()> {
-        let mut response = String::new();
-        let login_str = format!("user {} pass {} vers aprs_inet 0.0_1", callsign, password);
-        self.send_all(login_str).await?;
-        let n = self.read_message(&mut response).await?;
+        let mut buf = String::new();
+        let n = reader.read_line(&mut buf).await?;
         if n > 0 {
-            tracing::info!("server response = {:?}", response);
-            let response = response
-                .split(|c| [' ', ','].contains(&c))
-                .collect::<Vec<_>>();
-            let is_verified = *response.get(3).unwrap_or(&"");
-            if is_verified == "verified" || password == "-1" {
-                return Ok(());
+            tracing::info!("login response {}", buf);
+            if buf.contains("verified") || password == "-1" {
+                let (tx, rx) = mpsc::channel(32);
+
+                let sender = callsign.to_string();
+
+                let acknum = Arc::new(Mutex::new(0));
+                let ackpool = Arc::new(Mutex::new(Vec::new()));
+                let ackpool_thread = ackpool.clone();
+
+                let writer = Arc::new(Mutex::new(writer));
+                let writer_thread = writer.clone();
+                let _handle = tokio::spawn(async move {
+                    AprsIS::run(&sender, reader, &writer_thread, &ackpool_thread, tx).await
+                });
+
+                return Ok(Self {
+                    acknum,
+                    ackpool,
+                    rx,
+                    sender: callsign.to_string(),
+                    writer,
+                    _handle,
+                });
             }
-            bail!(format!("incorrect password {:?}",response))
         }
-        bail!("incorrect server response")
+        bail!("login error")
+    }
+
+    async fn add_ack(
+        ackpool: &Arc<Mutex<Vec<MsgHist>>>,
+        addressee: &str,
+        acknum: i32,
+    ) -> Result<()> {
+        let mut ackpool = ackpool.lock().await;
+
+        let now = SystemTime::now();
+        let since = now - Duration::new(15 * 60, 0);
+
+        ackpool.retain(|m| m.time > since);
+        ackpool.push(MsgHist {
+            time: now,
+            addressee: addressee.to_string(),
+            acknum,
+        });
+        Ok(())
+    }
+
+    async fn new_ack(acknum: &Arc<Mutex<i32>>, ackpool: &Arc<Mutex<Vec<MsgHist>>>) -> Result<i32> {
+        let mut ackpool = ackpool.lock().await;
+        let mut acknum = acknum.lock().await;
+
+        let now = SystemTime::now();
+        let since = now - Duration::new(15 * 60, 0);
+
+        ackpool.retain(|m| m.time > since);
+        *acknum = (*acknum + 1) % 100;
+
+        Ok(*acknum)
+    }
+
+    async fn find_ack(ackpool: &Arc<Mutex<Vec<MsgHist>>>, from: &str, acknum: i32) -> Result<bool> {
+        let mut ackpool = ackpool.lock().await;
+
+        let result = ackpool
+            .iter()
+            .find(|m| m.acknum == acknum && m.addressee == from);
+
+        if result.is_some() {
+            ackpool.retain(|m| m.acknum != acknum || m.addressee != from);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn send_all(writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>, buf: String) -> Result<()> {
+        let buf = buf.trim_end_matches(&['\r', '\n'][..]).to_string() + "\r\n";
+        let mut writer = writer.lock().await;
+        tracing::info!("send message = {}", buf);
+        writer.write_all(buf.as_bytes()).await?;
+        writer.flush().await?;
+
+        Ok(())
     }
 
     pub async fn set_filter(&mut self, filter: String) -> Result<()> {
         let buf = format!("#filter {}", filter);
-        self.send_all(buf).await?;
+        AprsIS::send_all(&self.writer, buf).await?;
         Ok(())
     }
 
@@ -103,70 +172,183 @@ impl AprsIS {
         self.set_filter(format!("b/{}", filter)).await
     }
 
-    pub async fn run(&mut self) -> Result<JoinHandle<()>> {
+    async fn send_ack(
+        writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+        sender: &String,
+        mut addressee: String,
+        id: String,
+    ) -> Result<()> {
+        addressee += "        ";
+        addressee.truncate(9);
+        let buf = format!("{}>APRS,TCPIP*::{}:ack{}", sender, addressee, id);
+        AprsIS::send_all(writer, buf).await?;
+        Ok(())
+    }
+
+    pub async fn write_message(&self, addressee: String, messages: String) -> Result<()> {
+        let sender = self.sender.clone();
+
+        let mut to_addr = format!("{}         ", addressee);
+        to_addr.truncate(9);
+
+        let header = format!("{}>APRS,TCPIP*::{}:", sender, to_addr);
+
+        for message in messages.lines() {
+            let body = format!(
+                "{}{}",
+                header,
+                if message.len() > 67 {
+                    &message[..67]
+                } else {
+                    &message
+                }
+            );
+            let mut wait_time = 7;
+            let acknum = AprsIS::new_ack(&self.acknum, &self.ackpool).await.unwrap();
+            for _i in 0..3 {
+                AprsIS::send_all(&self.writer, format!("{}{{{}", body, acknum))
+                    .await
+                    .unwrap();
+                sleep(Duration::from_secs(wait_time)).await;
+                if AprsIS::find_ack(&self.ackpool, &addressee, acknum)
+                    .await
+                    .unwrap()
+                {
+                    break;
+                };
+                wait_time *= 2;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn read_packet(&mut self) -> Result<AprsData> {
+        if let Some(packet) = self.rx.recv().await {
+            Ok(packet)
+        } else {
+            bail!("packet read error")
+        }
+    }
+
+    async fn run(
+        sender: &String,
+        mut reader: BufReader<OwnedReadHalf>,
+        writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+        ackpool: &Arc<Mutex<Vec<MsgHist>>>,
+        tx: mpsc::Sender<AprsData>,
+    ) -> Result<()> {
+        let re_ack = Regex::new(r"ack(\d+)").unwrap();
 
         loop {
             let mut buf = String::new();
-            match self.read_message(&mut buf).await {
+
+            match reader.read_line(&mut buf).await {
                 Ok(n) if n > 0 && !buf.starts_with("#") => {
-                    match AprsPacket::decode_textual(buf.as_bytes()) {
-                        Ok(AprsPacket { from, data, .. }) => {
-                            tracing::info!("from = {}-{:?}", from.call(), from.ssid());
-                            match data {
-                                AprsData::Position(AprsPosition {
-                                    to,
+                    buf = buf.trim_end_matches("\r\n").to_string();
+
+                    match aprs_parser::AprsPacket::decode_textual(buf.as_bytes()) {
+                        Ok(aprs_parser::AprsPacket { from, data, .. }) => {
+                            let mut from_call = from.call().to_string();
+                            from_call = from_call.trim_end().to_string();
+
+                            if from.ssid().is_some() {
+                                from_call += &format!("-{}", from.ssid().unwrap());
+                            }
+
+                            match &data {
+                                aprs_parser::AprsData::Position(aprs_parser::AprsPosition {
                                     latitude,
                                     longitude,
                                     ..
                                 }) => {
-                                    tracing::info!(
-                                        "poisition to={:?}, lat={:?} lon={:?}",
-                                        to,
-                                        latitude,
-                                        longitude
-                                    );
-                                    //self.tx.try_send(data);
+                                    let packet = AprsData::AprsPosition {
+                                        callsign: from_call,
+                                        longitude: **longitude,
+                                        latitude: **latitude,
+                                    };
+                                    tx.try_send(packet).unwrap_or_else(|e| {
+                                        tracing::error!("packet send failed {:?}", e)
+                                    });
                                 }
-                                AprsData::MicE(AprsMicE {
+
+                                aprs_parser::AprsData::MicE(aprs_parser::AprsMicE {
                                     latitude,
                                     longitude,
                                     ..
                                 }) => {
-                                    tracing::info!("mic-e lat={:?} lon={:?}", latitude, longitude);
-                                    //self.tx.try_send(data);
+                                    let packet = AprsData::AprsPosition {
+                                        callsign: from_call,
+                                        longitude: **longitude,
+                                        latitude: **latitude,
+                                    };
+                                    tx.try_send(packet).unwrap_or_else(|e| {
+                                        tracing::error!("packet send failed {:?}", e)
+                                    });
                                 }
-                                AprsData::Message(AprsMessage {
-                                    to,
+
+                                aprs_parser::AprsData::Message(aprs_parser::AprsMessage {
                                     addressee,
                                     text,
                                     id,
+                                    ..
                                 }) => {
-                                    let addressee =
-                                        String::from_utf8(addressee).unwrap_or_default();
-                                    let message = String::from_utf8(text).unwrap_or_default();
-                                    tracing::info!(
-                                        "message to={} addressee = {} message={} id={:?}",
-                                        to,
-                                        addressee,
-                                        message,
-                                        id
-                                    );
+                                    let mut addressee =
+                                        String::from_utf8(addressee.clone()).unwrap_or_default();
+                                    let mut message =
+                                        String::from_utf8(text.clone()).unwrap_or_default();
+
+                                    addressee = addressee.trim_end().to_string();
+                                    message = message.trim_end_matches("\r\n").to_string();
+
+                                    if addressee == *sender {
+                                        tracing::info!("Message from {}: {}", from_call, message);
+
+                                        if let Some(acknum) = re_ack
+                                            .captures(&message)
+                                            .and_then(|c| c.get(1))
+                                            .and_then(|m| m.as_str().parse::<i32>().ok())
+                                        {
+                                            AprsIS::add_ack(ackpool, &from_call, acknum).await?;
+                                            continue;
+                                        }
+                                        if let Some(id) = id.clone() {
+                                            let id = String::from_utf8(id).unwrap_or_default();
+                                            AprsIS::send_ack(writer, sender, from_call.clone(), id)
+                                                .await?;
+                                        }
+                                        let packet = AprsData::AprsMesasge {
+                                            callsign: from_call,
+                                            addressee,
+                                            message,
+                                        };
+                                        tx.try_send(packet).unwrap_or_else(|e| {
+                                            tracing::error!("packet send failed {:?}", e)
+                                        });
+                                    }
                                 }
-                                p => { tracing::info!("discard packer {:?}",p)}
+
+                                _packet => { //tracing::info!("discard packer {:?}",_packet)
+                                }
                             }
                         }
-                        Err(e) => tracing::warn!("parse error {}", e),
+
+                        Err(e) => {
+                            tracing::info!("parser decode error {}", e);
+                        }
                     }
                 }
-                Ok(_) => { tracing::info!("skip server response {}", buf);
+                Ok(_) => {
+                    tracing::info!("skip server response {}", buf);
                 }
-                Err(e) => { tracing::warn!("parket formart error :{:?}", e)
+
+                Err(e) => {
+                    tracing::info!("parket formart error :{:?}", e)
                 }
             }
         }
     }
 }
- 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,27 +356,53 @@ mod tests {
     use tokio;
     #[tokio::test]
     async fn it_works() {
-        tracing_subscriber::fmt::init();
+        tracing_subscriber::fmt()
+            .event_format(
+                tracing_subscriber::fmt::format()
+                    .with_file(true)
+                    .with_line_number(true),
+            )
+            .init();
         let aprshost = env::var("APRSHOST").unwrap();
         let aprsuser = env::var("APRSUSER").unwrap();
         let aprspasword = env::var("APRSPASSWORD").unwrap();
-        let mut userfilter = aprsuser.clone();
-        userfilter = userfilter
+        let mut server = AprsIS::connect(&aprshost, &aprsuser, &aprspasword)
+            .await
+            .expect("Can not connect server");
+
+        let userfilter = aprsuser.clone();
+        let userfilter = userfilter
             .rsplit_once('-')
             .map(|(before, _)| format!("{}-*", before))
             .unwrap_or(userfilter);
         let filter = format!("r/35.684074/139.75296/100 b/{}", userfilter);
+
         tracing::info!("set filter to {}", filter);
-        let mut server = AprsIS::connect(&aprshost)
-            .await
-            .expect("Can not connect server");
-        server
-            .login(&aprsuser, &aprspasword)
-            .await
-            .expect("Login failure");
         server.set_filter(filter).await.expect("set filter faied");
+
+        let _ = server
+            .write_message(
+                "JL1NIE-7".to_string(),
+                "Hello World, APRS messaging test.".to_string(),
+            )
+            .await;
         tracing::info!("running");
-        let handle = async { server.run().await.expect("message error").await };
-        let _res = tokio::join!(handle);
+        loop {
+            if let Ok(packet) = server.read_packet().await {
+                tracing::info!("packet = {:?}", packet);
+                match packet {
+                    AprsData::AprsMesasge {
+                        callsign, message, ..
+                    } => {
+                        let _ = server
+                            .write_message(callsign, format!("reply={}", message))
+                            .await;
+                    }
+                    _ => {}
+                }
+            } else {
+                panic!("channel closed");
+            }
+        }
     }
 }
