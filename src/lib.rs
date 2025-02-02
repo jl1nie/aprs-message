@@ -164,12 +164,12 @@ impl AprsIS {
         Ok(())
     }
 
-    pub async fn set_prefix_filer(&mut self, prefix: Vec<String>) -> Result<()> {
+    pub async fn set_prefix_filter(&mut self, prefix: Vec<String>) -> Result<()> {
         let filter = prefix.join("/");
         self.set_filter(format!("p/{}", filter)).await
     }
 
-    pub async fn set_budlist_filer(&mut self, buddy: Vec<String>) -> Result<()> {
+    pub async fn set_budlist_filter(&mut self, buddy: Vec<String>) -> Result<()> {
         let filter = buddy.join("/");
         self.set_filter(format!("b/{}", filter)).await
     }
@@ -187,7 +187,7 @@ impl AprsIS {
         Ok(())
     }
 
-    pub async fn write_message(&self, addressee: String, messages: String) -> Result<()> {
+    pub async fn write_message(&self, addressee: &str, messages: &str) -> Result<()> {
         let sender = self.sender.clone();
 
         let mut to_addr = format!("{}         ", addressee);
@@ -212,7 +212,7 @@ impl AprsIS {
                     .await
                     .unwrap();
                 sleep(Duration::from_secs(wait_time)).await;
-                if AprsIS::find_ack(&self.ackpool, &addressee, acknum)
+                if AprsIS::find_ack(&self.ackpool, addressee, acknum)
                     .await
                     .unwrap()
                 {
@@ -383,12 +383,6 @@ mod tests {
         tracing::info!("set filter to {}", filter);
         server.set_filter(filter).await.expect("set filter faied");
 
-        let _ = server
-            .write_message(
-                "JL1NIE-5".to_string(),
-                "Hello World, APRS messaging test.".to_string(),
-            )
-            .await;
         tracing::info!("running");
         loop {
             if let Ok(packet) = server.read_packet().await {
@@ -398,7 +392,7 @@ mod tests {
                         callsign, message, ..
                     } => {
                         let _ = server
-                            .write_message(callsign, format!("reply={}", message))
+                            .write_message(&callsign, &format!("{}", message))
                             .await;
                     }
                     _ => {}
