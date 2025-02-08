@@ -16,11 +16,13 @@ use tracing::{span, Level};
 pub enum AprsData {
     AprsPosition {
         callsign: String,
+        ssid: Option<String>,
         longitude: f64,
         latitude: f64,
     },
     AprsMesasge {
         callsign: String,
+        ssid: Option<String>,
         addressee: String,
         message: String,
     },
@@ -251,12 +253,15 @@ impl AprsIS {
 
                     match aprs_parser::AprsPacket::decode_textual(buf.as_bytes()) {
                         Ok(aprs_parser::AprsPacket { from, data, .. }) => {
-                            let mut from_call = from.call().to_string();
-                            from_call = from_call.trim_end().to_string();
+                            let mut callsign = from.call().to_string();
+                            callsign = callsign.trim_end().to_string();
 
-                            if from.ssid().is_some() {
-                                from_call += &format!("-{}", from.ssid().unwrap());
-                            }
+                            let ssid = if from.ssid().is_some() {
+                                callsign = format!("{}-{}", callsign, from.ssid().unwrap());
+                                Some(from.ssid().unwrap().to_string())
+                            } else {
+                                None
+                            };
 
                             match &data {
                                 aprs_parser::AprsData::Position(aprs_parser::AprsPosition {
@@ -265,7 +270,8 @@ impl AprsIS {
                                     ..
                                 }) => {
                                     let packet = AprsData::AprsPosition {
-                                        callsign: from_call,
+                                        callsign,
+                                        ssid,
                                         longitude: **longitude,
                                         latitude: **latitude,
                                     };
@@ -280,7 +286,8 @@ impl AprsIS {
                                     ..
                                 }) => {
                                     let packet = AprsData::AprsPosition {
-                                        callsign: from_call,
+                                        callsign,
+                                        ssid,
                                         longitude: **longitude,
                                         latitude: **latitude,
                                     };
@@ -304,23 +311,22 @@ impl AprsIS {
                                     message = message.trim_end_matches("\r\n").to_string();
 
                                     if addressee == *sender {
-                                        tracing::info!("Message from {}: {}", from_call, message);
-
                                         if let Some(acknum) = re_ack
                                             .captures(&message)
                                             .and_then(|c| c.get(1))
                                             .and_then(|m| m.as_str().parse::<i32>().ok())
                                         {
-                                            AprsIS::store_ack(ackpool, &from_call, acknum).await?;
+                                            AprsIS::store_ack(ackpool, &callsign, acknum).await?;
                                             continue;
                                         }
                                         if let Some(id) = id.clone() {
                                             let id = String::from_utf8(id).unwrap_or_default();
-                                            AprsIS::send_ack(writer, sender, from_call.clone(), id)
+                                            AprsIS::send_ack(writer, sender, callsign.clone(), id)
                                                 .await?;
                                         }
                                         let packet = AprsData::AprsMesasge {
-                                            callsign: from_call,
+                                            callsign,
+                                            ssid,
                                             addressee,
                                             message,
                                         };
@@ -330,8 +336,7 @@ impl AprsIS {
                                     }
                                 }
 
-                                _packet => { //tracing::info!("discard packer {:?}",_packet)
-                                }
+                                _packet => {}
                             }
                         }
 
@@ -340,9 +345,8 @@ impl AprsIS {
                         }
                     }
                 }
-                Ok(_) => {
-                    tracing::info!("skip server response {}", buf);
-                }
+
+                Ok(_) => {}
 
                 Err(e) => {
                     tracing::info!("parket formart error :{:?}", e)
@@ -374,14 +378,19 @@ mod tests {
             .expect("Can not connect server");
 
         let userfilter = aprsuser.clone();
-        let userfilter = userfilter
+        let userfilter = vec![userfilter
             .rsplit_once('-')
-            .map(|(before, _)| format!("{}-*", before))
-            .unwrap_or(userfilter);
-        let filter = format!("r/35.684074/139.75296/100 b/{}", userfilter);
+            .map(|(call, _)| call.to_string())
+            .unwrap_or(userfilter)];
 
-        tracing::info!("set filter to {}", filter);
-        server.set_filter(filter).await.expect("set filter faied");
+        //let filter = format!("r/35.684074/139.75296/100 b/{}", userfilter);
+        //tracing::info!("set filter to {}", filter);
+        //server.set_filter(filter).await.expect("set filter faied");
+
+        server
+            .set_budlist_filter(userfilter)
+            .await
+            .expect("set filter faied");
 
         tracing::info!("running");
         loop {
@@ -392,7 +401,7 @@ mod tests {
                         callsign, message, ..
                     } => {
                         let _ = server
-                            .write_message(&callsign, &format!("{}", message))
+                            .write_message(&callsign, &format!("reply={}", message))
                             .await;
                     }
                     _ => {}
