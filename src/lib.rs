@@ -16,13 +16,13 @@ use tracing::{span, Level};
 pub enum AprsData {
     AprsPosition {
         callsign: String,
-        ssid: Option<String>,
+        ssid: Option<u32>,
         longitude: f64,
         latitude: f64,
     },
     AprsMesasge {
         callsign: String,
-        ssid: Option<String>,
+        ssid: Option<u32>,
         addressee: String,
         message: String,
     },
@@ -258,7 +258,7 @@ impl AprsIS {
 
                             let ssid = if from.ssid().is_some() {
                                 callsign = format!("{}-{}", callsign, from.ssid().unwrap());
-                                Some(from.ssid().unwrap().to_string())
+                                Some(from.ssid().unwrap().parse::<u32>().unwrap_or_default())
                             } else {
                                 None
                             };
