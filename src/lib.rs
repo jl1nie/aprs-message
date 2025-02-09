@@ -75,6 +75,8 @@ impl AprsIS {
         let _enter = span.enter();
 
         let stream = TcpStream::connect(host).await?;
+        stream.set_nodelay(true)?;
+
         let (rh, wh) = stream.into_split();
         let mut reader = BufReader::new(rh);
         let mut writer = BufWriter::new(wh);
@@ -111,6 +113,7 @@ impl AprsIS {
                 let writer = Arc::new(Mutex::new(writer));
                 let writer_thread = writer.clone();
                 let rx = Arc::new(Mutex::new(rx));
+
                 let _handle = Arc::new(tokio::spawn(async move {
                     AprsIS::run(&sender, reader, &writer_thread, &ackpool_thread, tx).await
                 }));
@@ -372,10 +375,12 @@ impl AprsIS {
                     }
                 }
 
-                Ok(_) => {}
+                Ok(_) => {
+                    tracing::info!("server ident:{}", buf);
+                }
 
                 Err(e) => {
-                    tracing::info!("parket formart error :{:?}", e)
+                    tracing::info!("parket formart error:{:?}", e)
                 }
             }
         }
