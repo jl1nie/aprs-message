@@ -14,8 +14,8 @@ use tracing::{span, Level};
 
 #[derive(Debug)]
 pub struct AprsCallsign {
-    callsign: String,
-    ssid: Option<u32>,
+    pub callsign: String,
+    pub ssid: Option<u32>,
 }
 
 impl From<&AprsCallsign> for String {
@@ -24,6 +24,18 @@ impl From<&AprsCallsign> for String {
             Some(ssid) => format!("{}-{}", c.callsign, ssid),
             None => c.callsign.clone(),
         }
+    }
+}
+
+impl From<&String> for AprsCallsign {
+    fn from(c: &String) -> Self {
+        let mut ssid = None;
+        let mut callsign = c.trim_end().to_string();
+        if let Some((new_callsign, new_ssid)) = callsign.rsplit_once('-') {
+            ssid = new_ssid.parse::<u32>().ok();
+            callsign = new_callsign.to_string();
+        }
+        AprsCallsign { callsign, ssid }
     }
 }
 
@@ -373,7 +385,7 @@ impl AprsIS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
+    use std::{env, ptr::addr_of};
     use tokio;
     #[tokio::test]
     async fn it_works() {
@@ -412,8 +424,17 @@ mod tests {
                 tracing::info!("packet = {:?}", packet);
                 match packet {
                     AprsData::AprsMesasge {
-                        callsign, message, ..
+                        callsign,
+                        addressee,
+                        message,
                     } => {
+                        let addressee: AprsCallsign = AprsCallsign::from(&addressee);
+                        tracing::info!(
+                            "message from {:?} to {:?} = {}",
+                            callsign,
+                            addressee,
+                            message
+                        );
                         let _ = server
                             .write_message(&callsign, &format!("reply={}", message))
                             .await;
