@@ -13,16 +13,29 @@ use tokio::time::sleep;
 use tracing::{span, Level};
 
 #[derive(Debug)]
+pub struct AprsCallsign {
+    callsign: String,
+    ssid: Option<u32>,
+}
+
+impl From<&AprsCallsign> for String {
+    fn from(c: &AprsCallsign) -> Self {
+        match c.ssid {
+            Some(ssid) => format!("{}-{}", c.callsign, ssid),
+            None => c.callsign.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum AprsData {
     AprsPosition {
-        callsign: String,
-        ssid: Option<u32>,
+        callsign: AprsCallsign,
         longitude: f64,
         latitude: f64,
     },
     AprsMesasge {
-        callsign: String,
-        ssid: Option<u32>,
+        callsign: AprsCallsign,
         addressee: String,
         message: String,
     },
@@ -178,7 +191,7 @@ impl AprsIS {
 
     async fn send_ack(
         writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
-        sender: &String,
+        sender: &str,
         mut addressee: String,
         id: String,
     ) -> Result<()> {
@@ -189,8 +202,9 @@ impl AprsIS {
         Ok(())
     }
 
-    pub async fn write_message(&self, addressee: &str, messages: &str) -> Result<()> {
+    pub async fn write_message(&self, addressee: &AprsCallsign, messages: &str) -> Result<()> {
         let sender = self.sender.clone();
+        let addressee: String = addressee.into();
 
         let mut to_addr = format!("{}         ", addressee);
         to_addr.truncate(9);
@@ -214,7 +228,7 @@ impl AprsIS {
                     .await
                     .unwrap();
                 sleep(Duration::from_secs(wait_time)).await;
-                if AprsIS::find_ack(&self.ackpool, addressee, acknum)
+                if AprsIS::find_ack(&self.ackpool, &addressee, acknum)
                     .await
                     .unwrap()
                 {
@@ -257,11 +271,12 @@ impl AprsIS {
                             callsign = callsign.trim_end().to_string();
 
                             let ssid = if from.ssid().is_some() {
-                                callsign = format!("{}-{}", callsign, from.ssid().unwrap());
                                 Some(from.ssid().unwrap().parse::<u32>().unwrap_or_default())
                             } else {
                                 None
                             };
+
+                            let callsign = AprsCallsign { callsign, ssid };
 
                             match &data {
                                 aprs_parser::AprsData::Position(aprs_parser::AprsPosition {
@@ -271,7 +286,6 @@ impl AprsIS {
                                 }) => {
                                     let packet = AprsData::AprsPosition {
                                         callsign,
-                                        ssid,
                                         longitude: **longitude,
                                         latitude: **latitude,
                                     };
@@ -287,7 +301,6 @@ impl AprsIS {
                                 }) => {
                                     let packet = AprsData::AprsPosition {
                                         callsign,
-                                        ssid,
                                         longitude: **longitude,
                                         latitude: **latitude,
                                     };
@@ -311,22 +324,23 @@ impl AprsIS {
                                     message = message.trim_end_matches("\r\n").to_string();
 
                                     if addressee == *sender {
+                                        let from = String::from(&callsign);
+
                                         if let Some(acknum) = re_ack
                                             .captures(&message)
                                             .and_then(|c| c.get(1))
                                             .and_then(|m| m.as_str().parse::<i32>().ok())
                                         {
-                                            AprsIS::store_ack(ackpool, &callsign, acknum).await?;
+                                            AprsIS::store_ack(ackpool, &from, acknum).await?;
                                             continue;
                                         }
+
                                         if let Some(id) = id.clone() {
                                             let id = String::from_utf8(id).unwrap_or_default();
-                                            AprsIS::send_ack(writer, sender, callsign.clone(), id)
-                                                .await?;
+                                            AprsIS::send_ack(writer, sender, from, id).await?;
                                         }
                                         let packet = AprsData::AprsMesasge {
                                             callsign,
-                                            ssid,
                                             addressee,
                                             message,
                                         };
