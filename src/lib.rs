@@ -376,7 +376,7 @@ impl AprsIS {
                 }
 
                 Ok(_) => {
-                    tracing::info!("server ident:{}", buf);
+                    //tracing::info!("server ident:{}", buf);
                 }
 
                 Err(e) => {
@@ -390,7 +390,7 @@ impl AprsIS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, ptr::addr_of};
+    use std::env;
     use tokio;
     #[tokio::test]
     async fn it_works() {
