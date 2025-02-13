@@ -9,7 +9,6 @@ use tokio::net::{
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 use tracing::{span, Level};
 
 #[derive(Debug)]
@@ -224,33 +223,40 @@ impl AprsIS {
         let mut to_addr = format!("{}         ", addressee);
         to_addr.truncate(9);
 
-        let header = format!("{}>APRS,TCPIP*::{}:", sender, to_addr);
-
         for message in messages.lines() {
-            let body = format!(
-                "{}{}",
-                header,
-                if message.len() > 67 {
-                    &message[..67]
-                } else {
-                    &message
+            let message = message.to_string();
+            let ackpool = self.ackpool.clone();
+            let addressee = addressee.clone();
+            let writer = self.writer.clone();
+            let acknum = self.acknum.clone();
+            let header = format!("{}>APRS,TCPIP*::{}:", sender, to_addr);
+            tokio::spawn(async move {
+                let body = format!(
+                    "{}{}",
+                    header,
+                    if message.len() > 67 {
+                        &message[..67]
+                    } else {
+                        &message
+                    }
+                );
+                let mut wait_time = 7;
+                let acknum = AprsIS::new_ack(&acknum, &ackpool).await.unwrap();
+                for _i in 0..3 {
+                    AprsIS::send_all(&writer, format!("{}{{{}", body, acknum))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(wait_time)).await;
+                    if AprsIS::find_ack(&ackpool, &addressee, acknum)
+                        .await
+                        .unwrap()
+                    {
+                        break;
+                    };
+                    wait_time *= 2;
                 }
-            );
-            let mut wait_time = 7;
-            let acknum = AprsIS::new_ack(&self.acknum, &self.ackpool).await.unwrap();
-            for _i in 0..3 {
-                AprsIS::send_all(&self.writer, format!("{}{{{}", body, acknum))
-                    .await
-                    .unwrap();
-                sleep(Duration::from_secs(wait_time)).await;
-                if AprsIS::find_ack(&self.ackpool, &addressee, acknum)
-                    .await
-                    .unwrap()
-                {
-                    break;
-                };
-                wait_time *= 2;
-            }
+            });
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
         Ok(())
     }
@@ -441,7 +447,7 @@ mod tests {
                             message
                         );
                         let _ = server
-                            .write_message(&callsign, &format!("reply={}", message))
+                            .write_message(&callsign, &format!("reply={}\nLine2\nLine3", message))
                             .await;
                     }
                     _ => {}
