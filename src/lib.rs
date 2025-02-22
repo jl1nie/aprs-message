@@ -180,7 +180,6 @@ impl AprsIS {
     async fn send_all(writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>, buf: String) -> Result<()> {
         let buf = buf.trim_end_matches(&['\r', '\n'][..]).to_string() + "\r\n";
         let mut writer = writer.lock().await;
-        tracing::info!("send message = {}", buf);
         writer.write_all(buf.as_bytes()).await?;
         writer.flush().await?;
 
