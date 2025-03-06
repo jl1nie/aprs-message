@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{span, Level};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub struct AprsCallsign {
     pub callsign: String,
     pub ssid: Option<u32>,
