@@ -1,5 +1,6 @@
 use anyhow::{bail, Error, Result};
 use regex::Regex;
+use serde::Serialize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -11,7 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{span, Level};
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize)]
 pub struct AprsCallsign {
     pub callsign: String,
     pub ssid: Option<u32>,
