@@ -217,20 +217,20 @@ impl AprsIS {
     }
 
     pub async fn write_message(&self, addressee: &AprsCallsign, messages: &str) -> Result<()> {
-        let sender = self.sender.clone();
         let addressee: String = addressee.into();
-
         let mut to_addr = format!("{}         ", addressee);
         to_addr.truncate(9);
 
-        for message in messages.lines() {
-            let message = message.to_string();
-            let ackpool = self.ackpool.clone();
-            let addressee = addressee.clone();
-            let writer = self.writer.clone();
-            let acknum = self.acknum.clone();
-            let header = format!("{}>APRS,TCPIP*::{}:", sender, to_addr);
-            tokio::spawn(async move {
+        let ackpool = self.ackpool.clone();
+        let writer = self.writer.clone();
+        let acknum = self.acknum.clone();
+        let header = format!("{}>APRS,TCPIP*::{}:", self.sender, to_addr);
+        let messages = format!("{}", messages);
+
+        tokio::spawn(async move {
+            for message in messages.lines() {
+                let message = message.to_string();
+
                 let body = format!(
                     "{}{}",
                     header,
@@ -240,9 +240,9 @@ impl AprsIS {
                         &message
                     }
                 );
-                let mut wait_time = 7;
+                let mut wait_time = 10;
                 let acknum = AprsIS::new_ack(&acknum, &ackpool).await.unwrap();
-                for _i in 0..3 {
+                for _i in 0..2 {
                     AprsIS::send_all(&writer, format!("{}{{{}", body, acknum))
                         .await
                         .unwrap();
@@ -255,9 +255,8 @@ impl AprsIS {
                     };
                     wait_time *= 2;
                 }
-            });
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+            }
+        });
         Ok(())
     }
 
