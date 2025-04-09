@@ -1,6 +1,7 @@
 use anyhow::{bail, Error, Result};
 use regex::Regex;
 use serde::Serialize;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -66,7 +67,7 @@ pub struct AprsIS {
     rx: Arc<Mutex<mpsc::Receiver<AprsData>>>,
     sender: String,
     writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
-    _handle: Arc<JoinHandle<Result<(), Error>>>,
+    pub handle: Arc<JoinHandle<Result<(), Error>>>,
 }
 
 impl AprsIS {
@@ -114,7 +115,7 @@ impl AprsIS {
                 let writer_thread = writer.clone();
                 let rx = Arc::new(Mutex::new(rx));
 
-                let _handle = Arc::new(tokio::spawn(async move {
+                let handle = Arc::new(tokio::spawn(async move {
                     AprsIS::run(&sender, reader, &writer_thread, &ackpool_thread, tx).await
                 }));
 
@@ -124,7 +125,7 @@ impl AprsIS {
                     rx,
                     sender: callsign.to_string(),
                     writer,
-                    _handle,
+                    handle,
                 });
             }
         }
@@ -225,7 +226,7 @@ impl AprsIS {
         let writer = self.writer.clone();
         let acknum = self.acknum.clone();
         let header = format!("{}>APRS,TCPIP*::{}:", self.sender, to_addr);
-        let messages = format!("{}", messages);
+        let messages = messages.to_string();
 
         tokio::spawn(async move {
             for message in messages.lines() {
@@ -383,10 +384,15 @@ impl AprsIS {
                 Ok(_) => {
                     //tracing::info!("server ident:{}", buf);
                 }
-
-                Err(e) => {
-                    tracing::info!("parket formart error:{:?}", e)
-                }
+                Err(e) => match e.kind() {
+                    ErrorKind::ConnectionReset | ErrorKind::BrokenPipe => {
+                        tracing::error!("Connection lost: {:?}", e);
+                        return Err(e.into());
+                    }
+                    _ => {
+                        tracing::warn!("Unexpected read error: {:?}", e);
+                    }
+                },
             }
         }
     }
@@ -396,7 +402,6 @@ impl AprsIS {
 mod tests {
     use super::*;
     use std::env;
-    use tokio;
     #[tokio::test]
     async fn it_works() {
         tracing_subscriber::fmt()
