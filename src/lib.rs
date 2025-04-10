@@ -1,4 +1,4 @@
-use anyhow::{bail, Error, Result};
+use anyhow::{bail, Result};
 use regex::Regex;
 use serde::Serialize;
 use std::io::ErrorKind;
@@ -11,7 +11,7 @@ use tokio::net::{
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{span, Level};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize)]
 pub struct AprsCallsign {
@@ -31,7 +31,7 @@ impl From<&AprsCallsign> for String {
 impl From<&String> for AprsCallsign {
     fn from(c: &String) -> Self {
         let mut ssid = None;
-        let mut callsign = c.trim_end().to_string();
+        let mut callsign = c.trim().to_string();
         if let Some((new_callsign, new_ssid)) = callsign.rsplit_once('-') {
             ssid = new_ssid.parse::<u32>().ok();
             callsign = new_callsign.to_string();
@@ -60,21 +60,38 @@ struct MsgHist {
     addressee: String,
     acknum: i32,
 }
-#[derive(Clone)]
-pub struct AprsIS {
+
+/// 内部状態保持用。接続中のwriterとかrxとかを持つ～
+struct AprsWorkerState {
     acknum: Arc<Mutex<i32>>,
     ackpool: Arc<Mutex<Vec<MsgHist>>>,
     rx: Arc<Mutex<mpsc::Receiver<AprsData>>>,
-    sender: String,
     writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
-    pub handle: Arc<JoinHandle<Result<(), Error>>>,
+    sender: String,
 }
 
-impl AprsIS {
-    pub async fn connect(host: &str, callsign: &str, password: &str) -> Result<Self> {
-        let span = span!(Level::INFO, "AprsIS");
-        let _enter = span.enter();
+/// 実際の接続や再接続処理を行うワーカーだぜ！
+pub struct AprsWorker {
+    host: String,
+    callsign: String,
+    password: String,
+    state: Arc<Mutex<AprsWorkerState>>,
+    // 背景で動く再接続ループのタスク
+    handle: JoinHandle<()>,
+}
 
+impl AprsWorker {
+    // login処理。成功したら(reader, writer, tx, rx)返す！
+    async fn login(
+        host: &str,
+        callsign: &str,
+        password: &str,
+    ) -> Result<(
+        BufReader<OwnedReadHalf>,
+        Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+        mpsc::Sender<AprsData>,
+        Arc<Mutex<mpsc::Receiver<AprsData>>>,
+    )> {
         let stream = TcpStream::connect(host).await?;
         stream.set_nodelay(true)?;
 
@@ -84,12 +101,11 @@ impl AprsIS {
 
         let mut buf = String::new();
         let n = reader.read_line(&mut buf).await?;
-
-        tracing::info!("connect to {} read {} bytes {:?}", host, n, buf);
+        info!("connect to {} read {} bytes {:?}", host, n, buf);
         if n == 0 || !buf.starts_with("#") {
-            bail!("Invalid bannder from server")
+            bail!("Invalid banner from server")
         }
-        tracing::info!("succesfully connected");
+        info!("succesfully connected");
 
         let login_str = format!(
             "user {} pass {} vers aprs_inet 0.0_1\r\n",
@@ -98,180 +114,21 @@ impl AprsIS {
         writer.write_all(login_str.as_bytes()).await?;
         writer.flush().await?;
 
-        let mut buf = String::new();
+        buf.clear();
         let n = reader.read_line(&mut buf).await?;
-        if n > 0 {
-            tracing::info!("login response {}", buf);
-            if buf.contains("verified") || password == "-1" {
-                let (tx, rx) = mpsc::channel(32);
-
-                let sender = callsign.to_string();
-
-                let acknum = Arc::new(Mutex::new(0));
-                let ackpool = Arc::new(Mutex::new(Vec::new()));
-                let ackpool_thread = ackpool.clone();
-
-                let writer = Arc::new(Mutex::new(writer));
-                let writer_thread = writer.clone();
-                let rx = Arc::new(Mutex::new(rx));
-
-                let handle = Arc::new(tokio::spawn(async move {
-                    AprsIS::run(&sender, reader, &writer_thread, &ackpool_thread, tx).await
-                }));
-
-                return Ok(Self {
-                    acknum,
-                    ackpool,
-                    rx,
-                    sender: callsign.to_string(),
-                    writer,
-                    handle,
-                });
-            }
+        if n > 0 && (buf.contains("verified") || password == "-1") {
+            info!("login response {}", buf);
+            let (tx, rx) = mpsc::channel(32);
+            let writer = Arc::new(Mutex::new(writer));
+            let rx = Arc::new(Mutex::new(rx));
+            return Ok((reader, writer, tx, rx));
         }
         bail!("login error")
     }
 
-    async fn store_ack(
-        ackpool: &Arc<Mutex<Vec<MsgHist>>>,
-        addressee: &str,
-        acknum: i32,
-    ) -> Result<()> {
-        let mut ackpool = ackpool.lock().await;
-
-        let now = SystemTime::now();
-        let since = now - Duration::new(15 * 60, 0);
-
-        ackpool.retain(|m| m.time > since);
-        ackpool.push(MsgHist {
-            time: now,
-            addressee: addressee.to_string(),
-            acknum,
-        });
-        Ok(())
-    }
-
-    async fn new_ack(acknum: &Arc<Mutex<i32>>, ackpool: &Arc<Mutex<Vec<MsgHist>>>) -> Result<i32> {
-        let mut ackpool = ackpool.lock().await;
-        let mut acknum = acknum.lock().await;
-
-        let now = SystemTime::now();
-        let since = now - Duration::new(15 * 60, 0);
-
-        ackpool.retain(|m| m.time > since);
-        *acknum = (*acknum + 1) % 100;
-
-        Ok(*acknum)
-    }
-
-    async fn find_ack(ackpool: &Arc<Mutex<Vec<MsgHist>>>, from: &str, acknum: i32) -> Result<bool> {
-        let mut ackpool = ackpool.lock().await;
-
-        let result = ackpool
-            .iter()
-            .find(|m| m.acknum == acknum && m.addressee == from);
-
-        if result.is_some() {
-            ackpool.retain(|m| m.acknum != acknum || m.addressee != from);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn send_all(writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>, buf: String) -> Result<()> {
-        let buf = buf.trim_end_matches(&['\r', '\n'][..]).to_string() + "\r\n";
-        let mut writer = writer.lock().await;
-        writer.write_all(buf.as_bytes()).await?;
-        writer.flush().await?;
-
-        Ok(())
-    }
-
-    pub async fn set_filter(&self, filter: String) -> Result<()> {
-        let buf = format!("#filter {}", filter);
-        AprsIS::send_all(&self.writer, buf).await?;
-        Ok(())
-    }
-
-    pub async fn set_prefix_filter(&self, prefix: Vec<String>) -> Result<()> {
-        let filter = prefix.join("/");
-        self.set_filter(format!("p/{}", filter)).await
-    }
-
-    pub async fn set_budlist_filter(&self, buddy: Vec<String>) -> Result<()> {
-        let filter = buddy.join("/");
-        self.set_filter(format!("b/{}", filter)).await
-    }
-
-    async fn send_ack(
-        writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+    // run_loop：readerからパケットを読み出してtxに流す。接続が切れたらエラー返す！
+    async fn run_loop(
         sender: &str,
-        mut addressee: String,
-        id: String,
-    ) -> Result<()> {
-        addressee += "        ";
-        addressee.truncate(9);
-        let buf = format!("{}>APRS,TCPIP*::{}:ack{}", sender, addressee, id);
-        AprsIS::send_all(writer, buf).await?;
-        Ok(())
-    }
-
-    pub async fn write_message(&self, addressee: &AprsCallsign, messages: &str) -> Result<()> {
-        let addressee: String = addressee.into();
-        let mut to_addr = format!("{}         ", addressee);
-        to_addr.truncate(9);
-
-        let ackpool = self.ackpool.clone();
-        let writer = self.writer.clone();
-        let acknum = self.acknum.clone();
-        let header = format!("{}>APRS,TCPIP*::{}:", self.sender, to_addr);
-        let messages = messages.to_string();
-
-        tokio::spawn(async move {
-            for message in messages.lines() {
-                let message = message.to_string();
-
-                let body = format!(
-                    "{}{}",
-                    header,
-                    if message.len() > 67 {
-                        &message[..67]
-                    } else {
-                        &message
-                    }
-                );
-                let mut wait_time = 10;
-                let acknum = AprsIS::new_ack(&acknum, &ackpool).await.unwrap();
-                for _i in 0..2 {
-                    AprsIS::send_all(&writer, format!("{}{{{}", body, acknum))
-                        .await
-                        .unwrap();
-                    tokio::time::sleep(Duration::from_secs(wait_time)).await;
-                    if AprsIS::find_ack(&ackpool, &addressee, acknum)
-                        .await
-                        .unwrap()
-                    {
-                        break;
-                    };
-                    wait_time *= 2;
-                }
-            }
-        });
-        Ok(())
-    }
-
-    pub async fn read_packet(&self) -> Result<AprsData> {
-        let mut rx = self.rx.lock().await;
-        if let Some(packet) = rx.recv().await {
-            Ok(packet)
-        } else {
-            bail!("packet read error")
-        }
-    }
-
-    async fn run(
-        sender: &String,
         mut reader: BufReader<OwnedReadHalf>,
         writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         ackpool: &Arc<Mutex<Vec<MsgHist>>>,
@@ -281,23 +138,19 @@ impl AprsIS {
 
         loop {
             let mut buf = String::new();
-
             match reader.read_line(&mut buf).await {
                 Ok(n) if n > 0 && !buf.starts_with("#") => {
                     buf = buf.trim_end_matches("\r\n").to_string();
-
                     match aprs_parser::AprsPacket::decode_textual(buf.as_bytes()) {
                         Ok(aprs_parser::AprsPacket { from, data, .. }) => {
-                            let mut callsign = from.call().to_string();
-                            callsign = callsign.trim_end().to_string();
-
-                            let ssid = if from.ssid().is_some() {
-                                Some(from.ssid().unwrap().parse::<u32>().unwrap_or_default())
+                            let mut cs = from.call().to_string();
+                            cs = cs.trim_end().to_string();
+                            let ssid = if let Some(s) = from.ssid() {
+                                s.parse::<u32>().ok()
                             } else {
                                 None
                             };
-
-                            let callsign = AprsCallsign { callsign, ssid };
+                            let callsign = AprsCallsign { callsign: cs, ssid };
 
                             match &data {
                                 aprs_parser::AprsData::Position(aprs_parser::AprsPosition {
@@ -311,10 +164,9 @@ impl AprsIS {
                                         latitude: **latitude,
                                     };
                                     tx.try_send(packet).unwrap_or_else(|e| {
-                                        tracing::error!("packet send failed {:?}", e)
+                                        error!("packet send failed: {:?}", e);
                                     });
                                 }
-
                                 aprs_parser::AprsData::MicE(aprs_parser::AprsMicE {
                                     latitude,
                                     longitude,
@@ -326,10 +178,9 @@ impl AprsIS {
                                         latitude: **latitude,
                                     };
                                     tx.try_send(packet).unwrap_or_else(|e| {
-                                        tracing::error!("packet send failed {:?}", e)
+                                        error!("packet send failed: {:?}", e);
                                     });
                                 }
-
                                 aprs_parser::AprsData::Message(aprs_parser::AprsMessage {
                                     addressee,
                                     text,
@@ -340,25 +191,24 @@ impl AprsIS {
                                         String::from_utf8(addressee.clone()).unwrap_or_default();
                                     let mut message =
                                         String::from_utf8(text.clone()).unwrap_or_default();
-
                                     addressee = addressee.trim_end().to_string();
                                     message = message.trim_end_matches("\r\n").to_string();
 
                                     if addressee == *sender {
                                         let from = String::from(&callsign);
-
                                         if let Some(acknum) = re_ack
                                             .captures(&message)
-                                            .and_then(|c| c.get(1))
+                                            .and_then(|caps| caps.get(1))
                                             .and_then(|m| m.as_str().parse::<i32>().ok())
                                         {
-                                            AprsIS::store_ack(ackpool, &from, acknum).await?;
+                                            let _ =
+                                                Self::store_ack_inner(ackpool, &from, acknum).await;
                                             continue;
                                         }
-
                                         if let Some(id) = id.clone() {
                                             let id = String::from_utf8(id).unwrap_or_default();
-                                            AprsIS::send_ack(writer, sender, from, id).await?;
+                                            let _ = Self::send_ack_inner(writer, sender, &from, id)
+                                                .await;
                                         }
                                         let packet = AprsData::AprsMesasge {
                                             callsign,
@@ -366,38 +216,316 @@ impl AprsIS {
                                             message,
                                         };
                                         tx.try_send(packet).unwrap_or_else(|e| {
-                                            tracing::error!("packet send failed {:?}", e)
+                                            error!("packet send failed: {:?}", e);
                                         });
                                     }
                                 }
-
-                                _packet => {}
+                                _ => {}
                             }
                         }
-
                         Err(e) => {
-                            tracing::info!("parser decode error {}", e);
+                            info!("parser decode error: {}", e);
                         }
                     }
                 }
-
-                Ok(_) => {
-                    //tracing::info!("server ident:{}", buf);
-                }
+                Ok(_) => {}
                 Err(e) => match e.kind() {
                     ErrorKind::ConnectionReset | ErrorKind::BrokenPipe => {
-                        tracing::error!("Connection lost: {:?}", e);
+                        error!("Connection lost: {:?}", e);
                         return Err(e.into());
                     }
                     _ => {
-                        tracing::warn!("Unexpected read error: {:?}", e);
+                        warn!("Unexpected read error: {:?}", e);
                     }
                 },
             }
         }
     }
+
+    async fn send_ack_inner(
+        writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+        sender: &str,
+        addressee: &str,
+        id: String,
+    ) -> Result<()> {
+        let mut addressee = addressee.to_string() + "        ";
+        addressee.truncate(9);
+        let buf = format!("{}>APRS,TCPIP*::{}:ack{}", sender, addressee, id);
+        Self::send_all_inner(writer, buf).await
+    }
+
+    async fn send_all_inner(
+        writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+        buf: String,
+    ) -> Result<()> {
+        let buf = buf.trim_end_matches(&['\r', '\n'][..]).to_string() + "\r\n";
+        let mut w = writer.lock().await;
+        w.write_all(buf.as_bytes()).await?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    async fn store_ack_inner(
+        ackpool: &Arc<Mutex<Vec<MsgHist>>>,
+        addressee: &str,
+        acknum: i32,
+    ) -> Result<()> {
+        let mut pool = ackpool.lock().await;
+        let now = SystemTime::now();
+        let since = now - Duration::new(15 * 60, 0);
+        pool.retain(|m| m.time > since);
+        pool.push(MsgHist {
+            time: now,
+            addressee: addressee.to_string(),
+            acknum,
+        });
+        Ok(())
+    }
+
+    async fn find_ack_inner(
+        ackpool: &Arc<Mutex<Vec<MsgHist>>>,
+        from: &str,
+        acknum: i32,
+    ) -> Result<bool> {
+        let mut ackpool = ackpool.lock().await;
+
+        let result = ackpool
+            .iter()
+            .find(|m| m.acknum == acknum && m.addressee == from);
+
+        if result.is_some() {
+            // 見つかったら削除しちゃう！
+            ackpool.retain(|m| m.acknum != acknum || m.addressee != from);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn new_ack_inner(
+        acknum: &Arc<Mutex<i32>>,
+        ackpool: &Arc<Mutex<Vec<MsgHist>>>,
+    ) -> Result<i32> {
+        let mut ackpool = ackpool.lock().await;
+        let mut acknum = acknum.lock().await;
+
+        let now = SystemTime::now();
+        let since = now - Duration::new(15 * 60, 0);
+
+        // 古いのを削除～
+        ackpool.retain(|m| m.time > since);
+        *acknum = (*acknum + 1) % 100; // 1-99でループさせるの素敵～♡
+
+        Ok(*acknum)
+    }
+
+    async fn write_message_inner(
+        sender: &str,
+        writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
+        ackpool: &Arc<Mutex<Vec<MsgHist>>>,
+        acknum: &Arc<Mutex<i32>>,
+        addressee: &str,
+        messages: &str,
+    ) -> Result<()> {
+        let mut to_addr = format!("{}         ", addressee);
+        to_addr.truncate(9);
+
+        let header = format!("{}>APRS,TCPIP*::{}:", sender, to_addr);
+
+        for message in messages.lines() {
+            let message = message.to_string();
+
+            let body = format!(
+                "{}{}",
+                header,
+                if message.len() > 67 {
+                    &message[..67]
+                } else {
+                    &message
+                }
+            );
+
+            let mut wait_time = 10;
+            let ack = Self::new_ack_inner(acknum, ackpool).await?;
+
+            for _ in 0..2 {
+                let packet = format!("{}{{{}", body, ack);
+                Self::send_all_inner(writer, packet).await?;
+
+                tokio::time::sleep(Duration::from_secs(wait_time)).await;
+
+                if Self::find_ack_inner(ackpool, addressee, ack).await? {
+                    break;
+                }
+
+                wait_time *= 2;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Background reconnection loop. 再接続に成功したらstate.writerなどを更新するぜ！
+    async fn reconnect_loop(worker: Arc<Mutex<AprsWorker>>) {
+        loop {
+            {
+                let _worker_guard = worker.lock().await;
+                // ここでworker.state.writer等は最新状態
+                // もしrun_loopが落ちたなら、再接続処理に入るはず
+            }
+            // 簡単な例：一定時間ごとに再接続試行する。
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let (new_reader, new_writer, tx, _rx) = match Self::login(
+                &worker.lock().await.host,
+                &worker.lock().await.callsign,
+                &worker.lock().await.password,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Reconnection failed: {:?}", e);
+                    continue;
+                }
+            };
+            {
+                let worker_guard = worker.lock().await;
+                // 更新する！writerは新しいものに置き換える
+                worker_guard.state.lock().await.writer = new_writer.clone();
+                worker_guard.state.lock().await.sender = worker_guard.callsign.clone();
+
+                // Start new run_loop with new_reader in a detached task.
+                let sender_clone = worker_guard.callsign.clone();
+                let ackpool_clone = worker_guard.state.lock().await.ackpool.clone();
+                let writer_clone = new_writer.clone();
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    let _ = Self::run_loop(
+                        &sender_clone,
+                        new_reader,
+                        &writer_clone,
+                        &ackpool_clone,
+                        tx_clone,
+                    )
+                    .await;
+                });
+            }
+            info!("Reconnected and updated worker state.");
+            break;
+        }
+    }
 }
 
+/// --- Public API --- ///
+
+#[derive(Clone)]
+pub struct AprsIS {
+    worker: Arc<Mutex<AprsWorker>>,
+}
+
+impl AprsIS {
+    // 外部からのconnect。内部でAprsWorkerを生成して、背景で再接続ループも動かす～
+    pub async fn connect(host: &str, callsign: &str, password: &str) -> Result<Self> {
+        let (reader, writer, tx, rx) = AprsWorker::login(host, callsign, password).await?;
+        let state = Arc::new(Mutex::new(AprsWorkerState {
+            acknum: Arc::new(Mutex::new(0)),
+            ackpool: Arc::new(Mutex::new(Vec::new())),
+            rx,
+            writer: writer.clone(),
+            sender: callsign.to_string(),
+        }));
+
+        // Start initial run_loop
+        let state_clone = state.clone();
+        let sender_clone = callsign.to_string();
+        let worker_handle = tokio::spawn(async move {
+            let res = AprsWorker::run_loop(
+                &sender_clone,
+                reader,
+                &writer,
+                &state_clone.lock().await.ackpool,
+                tx,
+            )
+            .await;
+            if let Err(e) = res {
+                error!("run_loop exited with error: {:?}", e);
+            }
+        });
+
+        let worker = AprsWorker {
+            host: host.to_string(),
+            callsign: callsign.to_string(),
+            password: password.to_string(),
+            state,
+            handle: worker_handle,
+        };
+
+        let worker_arc = Arc::new(Mutex::new(worker));
+
+        // Start background reconnection loop (detach it)
+        {
+            let worker_clone = worker_arc.clone();
+            tokio::spawn(async move {
+                AprsWorker::reconnect_loop(worker_clone).await;
+            });
+        }
+
+        Ok(AprsIS { worker: worker_arc })
+    }
+
+    pub async fn read_packet(&self) -> Result<AprsData> {
+        let worker_guard = self.worker.lock().await;
+        let rx_guard = worker_guard.state.lock().await;
+        let mut rx = rx_guard.rx.lock().await;
+        if let Some(packet) = rx.recv().await {
+            Ok(packet)
+        } else {
+            bail!("packet read error")
+        }
+    }
+
+    pub async fn set_budlist_filter(&self, buddy: Vec<String>) -> Result<()> {
+        let filter = buddy.join("/");
+        self.set_filter(format!("b/{}", filter)).await
+    }
+
+    pub async fn set_filter(&self, filter: String) -> Result<()> {
+        let worker_guard = self.worker.lock().await;
+        let cmd = format!("#filter {}", filter);
+        AprsWorker::send_all_inner(&worker_guard.state.lock().await.writer, cmd).await?;
+        Ok(())
+    }
+
+    pub async fn write_message(&self, addressee: &AprsCallsign, messages: &str) -> Result<()> {
+        let addressee_str: String = addressee.into();
+        let worker_guard = self.worker.lock().await;
+        let state = worker_guard.state.lock().await;
+
+        let sender = state.sender.clone();
+        let writer = state.writer.clone();
+        let ackpool = state.ackpool.clone();
+        let acknum = state.acknum.clone();
+        let messages = messages.to_string();
+        let addressee_str_clone = addressee_str.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = AprsWorker::write_message_inner(
+                &sender,
+                &writer,
+                &ackpool,
+                &acknum,
+                &addressee_str_clone,
+                &messages,
+            )
+            .await
+            {
+                tracing::error!("APRS Message failed.: {:?}", e);
+            }
+        });
+
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
