@@ -40,7 +40,7 @@ impl From<&String> for AprsCallsign {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)] // ← Cloneつけるよ！データパスしやすくなる
 pub enum AprsData {
     AprsPosition {
         callsign: AprsCallsign,
@@ -61,27 +61,32 @@ struct MsgHist {
     acknum: i32,
 }
 
-/// 内部状態保持用。接続中のwriterとかrxとかを持つ～
+/// ワーカーの内部状態保持用
 struct AprsWorkerState {
     acknum: Arc<Mutex<i32>>,
     ackpool: Arc<Mutex<Vec<MsgHist>>>,
-    rx: Arc<Mutex<mpsc::Receiver<AprsData>>>,
     writer: Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
     sender: String,
 }
 
-/// 実際の接続や再接続処理を行うワーカーだぜ！
-pub struct AprsWorker {
+/// 接続状態を管理するワーカー
+struct AprsWorker {
     host: String,
     callsign: String,
     password: String,
     state: Arc<Mutex<AprsWorkerState>>,
-    // 背景で動く再接続ループのタスク
     handle: JoinHandle<()>,
 }
 
+/// 公開API！
+#[derive(Clone)]
+pub struct AprsIS {
+    worker: Arc<Mutex<AprsWorker>>,
+    rx: Arc<Mutex<mpsc::Receiver<AprsData>>>,
+}
+
 impl AprsWorker {
-    // login処理。成功したら(reader, writer, tx, rx)返す！
+    // login処理
     async fn login(
         host: &str,
         callsign: &str,
@@ -90,7 +95,6 @@ impl AprsWorker {
         BufReader<OwnedReadHalf>,
         Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         mpsc::Sender<AprsData>,
-        Arc<Mutex<mpsc::Receiver<AprsData>>>,
     )> {
         let stream = TcpStream::connect(host).await?;
         stream.set_nodelay(true)?;
@@ -118,21 +122,20 @@ impl AprsWorker {
         let n = reader.read_line(&mut buf).await?;
         if n > 0 && (buf.contains("verified") || password == "-1") {
             info!("login response {}", buf);
-            let (tx, rx) = mpsc::channel(32);
+            let (tx, _rx) = mpsc::channel(32); // _rxは使わない
             let writer = Arc::new(Mutex::new(writer));
-            let rx = Arc::new(Mutex::new(rx));
-            return Ok((reader, writer, tx, rx));
+            return Ok((reader, writer, tx));
         }
         bail!("login error")
     }
 
-    // run_loop：readerからパケットを読み出してtxに流す。接続が切れたらエラー返す！
+    // パケット読み出しループ
     async fn run_loop(
         sender: &str,
         mut reader: BufReader<OwnedReadHalf>,
         writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         ackpool: &Arc<Mutex<Vec<MsgHist>>>,
-        tx: mpsc::Sender<AprsData>,
+        tx: mpsc::Sender<AprsData>, // 外部送信用チャネル
     ) -> Result<()> {
         let re_ack = Regex::new(r"ack(\d+)").unwrap();
 
@@ -242,6 +245,7 @@ impl AprsWorker {
         }
     }
 
+    // 他のヘルパーメソッドはそのまま使う
     async fn send_ack_inner(
         writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         sender: &str,
@@ -314,7 +318,7 @@ impl AprsWorker {
 
         // 古いのを削除～
         ackpool.retain(|m| m.time > since);
-        *acknum = (*acknum + 1) % 100; // 1-99でループさせるの素敵～♡
+        *acknum = (*acknum + 1) % 100; // 1-99でループさせる
 
         Ok(*acknum)
     }
@@ -365,93 +369,106 @@ impl AprsWorker {
         Ok(())
     }
 
-    // Background reconnection loop. 再接続に成功したらstate.writerなどを更新するぜ！
-    async fn reconnect_loop(worker: Arc<Mutex<AprsWorker>>) {
+    // 再接続ロジック！
+    async fn reconnect_loop(worker: Arc<Mutex<AprsWorker>>, external_tx: mpsc::Sender<AprsData>) {
         loop {
-            {
-                let _worker_guard = worker.lock().await;
-                // ここでworker.state.writer等は最新状態
-                // もしrun_loopが落ちたなら、再接続処理に入るはず
-            }
-            // 簡単な例：一定時間ごとに再接続試行する。
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let (new_reader, new_writer, tx, _rx) = match Self::login(
-                &worker.lock().await.host,
-                &worker.lock().await.callsign,
-                &worker.lock().await.password,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    error!("Reconnection failed: {:?}", e);
-                    continue;
-                }
-            };
+            // ワーカーがアクティブかチェック
             {
                 let worker_guard = worker.lock().await;
-                // 更新する！writerは新しいものに置き換える
-                worker_guard.state.lock().await.writer = new_writer.clone();
-                worker_guard.state.lock().await.sender = worker_guard.callsign.clone();
-
-                // Start new run_loop with new_reader in a detached task.
-                let sender_clone = worker_guard.callsign.clone();
-                let ackpool_clone = worker_guard.state.lock().await.ackpool.clone();
-                let writer_clone = new_writer.clone();
-                let tx_clone = tx.clone();
-                tokio::spawn(async move {
-                    let _ = Self::run_loop(
-                        &sender_clone,
-                        new_reader,
-                        &writer_clone,
-                        &ackpool_clone,
-                        tx_clone,
-                    )
-                    .await;
-                });
+                // ここで状態チェックとか
             }
-            info!("Reconnected and updated worker state.");
-            break;
+
+            // 再接続待機
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            // 再接続試行
+            let host;
+            let callsign;
+            let password;
+
+            {
+                let w = worker.lock().await;
+                host = w.host.clone();
+                callsign = w.callsign.clone();
+                password = w.password.clone();
+            }
+
+            match Self::login(&host, &callsign, &password).await {
+                Ok((new_reader, new_writer, _tx)) => {
+                    // 成功したら状態更新
+                    let worker_guard = worker.lock().await;
+                    let mut state_guard = worker_guard.state.lock().await;
+
+                    // 新しいwriterで更新
+                    state_guard.writer = new_writer.clone();
+
+                    // ackpoolなどはそのまま再利用
+                    let ackpool_clone = state_guard.ackpool.clone();
+                    let sender_clone = callsign.clone();
+
+                    // run_loopで新しいreaderの読み込みを開始（外部チャネルにそのまま送信）
+                    tokio::spawn(async move {
+                        let _ = Self::run_loop(
+                            &sender_clone,
+                            new_reader,
+                            &new_writer,
+                            &ackpool_clone,
+                            external_tx,
+                        )
+                        .await;
+                    });
+
+                    info!("Successfully reconnected!");
+                    break; // 再接続成功したらループ終了
+                }
+                Err(e) => {
+                    error!("Reconnection failed: {:?}", e);
+                    // 次の再接続へ
+                }
+            }
         }
     }
 }
 
-/// --- Public API --- ///
-
-#[derive(Clone)]
-pub struct AprsIS {
-    worker: Arc<Mutex<AprsWorker>>,
-}
-
 impl AprsIS {
-    // 外部からのconnect。内部でAprsWorkerを生成して、背景で再接続ループも動かす～
+    // 外部API: connect
     pub async fn connect(host: &str, callsign: &str, password: &str) -> Result<Self> {
-        let (reader, writer, tx, rx) = AprsWorker::login(host, callsign, password).await?;
+        // 外部へのデータ送信用チャネル作成
+        let (tx, rx) = mpsc::channel(32);
+        let rx = Arc::new(Mutex::new(rx)); // ← ここでラップ！
+
+        // ログイン処理
+        let (reader, writer, _) = AprsWorker::login(host, callsign, password).await?;
+
+        // 状態作成
         let state = Arc::new(Mutex::new(AprsWorkerState {
             acknum: Arc::new(Mutex::new(0)),
             ackpool: Arc::new(Mutex::new(Vec::new())),
-            rx,
             writer: writer.clone(),
             sender: callsign.to_string(),
         }));
 
-        // Start initial run_loop
+        // 初期run_loop起動
         let state_clone = state.clone();
         let sender_clone = callsign.to_string();
+        let tx_clone = tx.clone();
+
         let worker_handle = tokio::spawn(async move {
             let res = AprsWorker::run_loop(
                 &sender_clone,
                 reader,
                 &writer,
                 &state_clone.lock().await.ackpool,
-                tx,
+                tx_clone,
             )
             .await;
+
             if let Err(e) = res {
-                error!("run_loop exited with error: {:?}", e);
+                error!("Run loop exited with error: {:?}", e);
             }
         });
 
+        // ワーカー作成
         let worker = AprsWorker {
             host: host.to_string(),
             callsign: callsign.to_string(),
@@ -462,70 +479,85 @@ impl AprsIS {
 
         let worker_arc = Arc::new(Mutex::new(worker));
 
-        // Start background reconnection loop (detach it)
-        {
-            let worker_clone = worker_arc.clone();
-            tokio::spawn(async move {
-                AprsWorker::reconnect_loop(worker_clone).await;
-            });
-        }
+        // バックグラウンド再接続ループ起動
+        let worker_clone = worker_arc.clone();
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            AprsWorker::reconnect_loop(worker_clone, tx_clone).await;
+        });
 
-        Ok(AprsIS { worker: worker_arc })
+        // インスタンス返却
+        Ok(Self {
+            worker: worker_arc,
+            rx, // 外部用チャネル
+        })
     }
 
+    // パケット読み出し - ロック不要！
     pub async fn read_packet(&self) -> Result<AprsData> {
-        let worker_guard = self.worker.lock().await;
-        let rx_guard = worker_guard.state.lock().await;
-        let mut rx = rx_guard.rx.lock().await;
-        if let Some(packet) = rx.recv().await {
+        let mut rx_guard = self.rx.lock().await;
+        if let Some(packet) = rx_guard.recv().await {
             Ok(packet)
         } else {
-            bail!("packet read error")
+            bail!("Packet channel closed")
         }
     }
 
+    // バディリスト設定
     pub async fn set_budlist_filter(&self, buddy: Vec<String>) -> Result<()> {
         let filter = buddy.join("/");
         self.set_filter(format!("b/{}", filter)).await
     }
 
+    // フィルター設定
     pub async fn set_filter(&self, filter: String) -> Result<()> {
         let worker_guard = self.worker.lock().await;
+        let state_guard = worker_guard.state.lock().await;
         let cmd = format!("#filter {}", filter);
-        AprsWorker::send_all_inner(&worker_guard.state.lock().await.writer, cmd).await?;
+        AprsWorker::send_all_inner(&state_guard.writer, cmd).await?;
         Ok(())
     }
 
+    // メッセージ送信
     pub async fn write_message(&self, addressee: &AprsCallsign, messages: &str) -> Result<()> {
         let addressee_str: String = addressee.into();
-        let worker_guard = self.worker.lock().await;
-        let state = worker_guard.state.lock().await;
 
-        let sender = state.sender.clone();
-        let writer = state.writer.clone();
-        let ackpool = state.ackpool.clone();
-        let acknum = state.acknum.clone();
-        let messages = messages.to_string();
-        let addressee_str_clone = addressee_str.clone();
+        // 必要な状態を取得して早めにロック解放
+        let (sender, writer, ackpool, acknum) = {
+            let worker_guard = self.worker.lock().await;
+            let state_guard = worker_guard.state.lock().await;
+            (
+                state_guard.sender.clone(),
+                state_guard.writer.clone(),
+                state_guard.ackpool.clone(),
+                state_guard.acknum.clone(),
+            )
+        };
 
+        // データのコピー
+        let messages_clone = messages.to_string();
+        let addressee_clone = addressee_str.clone();
+
+        // 送信処理を別タスクで実行
         tokio::spawn(async move {
             if let Err(e) = AprsWorker::write_message_inner(
                 &sender,
                 &writer,
                 &ackpool,
                 &acknum,
-                &addressee_str_clone,
-                &messages,
+                &addressee_clone,
+                &messages_clone,
             )
             .await
             {
-                tracing::error!("APRS Message failed.: {:?}", e);
+                error!("APRS message send failed: {:?}", e);
             }
         });
 
         Ok(())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,10 +583,6 @@ mod tests {
             .rsplit_once('-')
             .map(|(call, _)| call.to_string())
             .unwrap_or(userfilter)];
-
-        //let filter = format!("r/35.684074/139.75296/100 b/{}", userfilter);
-        //tracing::info!("set filter to {}", filter);
-        //server.set_filter(filter).await.expect("set filter faied");
 
         server
             .set_budlist_filter(userfilter)
