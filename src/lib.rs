@@ -75,7 +75,7 @@ struct AprsWorker {
     callsign: String,
     password: String,
     state: Arc<Mutex<AprsWorkerState>>,
-    handle: JoinHandle<()>,
+    _handle: JoinHandle<()>,
 }
 
 /// 公開API！
@@ -374,7 +374,7 @@ impl AprsWorker {
         loop {
             // ワーカーがアクティブかチェック
             {
-                let worker_guard = worker.lock().await;
+                let _worker_guard = worker.lock().await;
                 // ここで状態チェックとか
             }
 
@@ -474,7 +474,7 @@ impl AprsIS {
             callsign: callsign.to_string(),
             password: password.to_string(),
             state,
-            handle: worker_handle,
+            _handle: worker_handle,
         };
 
         let worker_arc = Arc::new(Mutex::new(worker));
