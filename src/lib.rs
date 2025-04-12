@@ -28,8 +28,8 @@ impl From<&AprsCallsign> for String {
     }
 }
 
-impl From<&String> for AprsCallsign {
-    fn from(c: &String) -> Self {
+impl From<String> for AprsCallsign {
+    fn from(c: String) -> Self {
         let mut ssid = None;
         let mut callsign = c.trim().to_string();
         if let Some((new_callsign, new_ssid)) = callsign.rsplit_once('-') {
@@ -47,7 +47,7 @@ pub enum AprsData {
         longitude: f64,
         latitude: f64,
     },
-    AprsMesasge {
+    AprsMessage {
         callsign: AprsCallsign,
         addressee: String,
         message: String,
@@ -75,7 +75,7 @@ struct AprsWorker {
     callsign: String,
     password: String,
     state: Arc<Mutex<AprsWorkerState>>,
-    _handle: JoinHandle<()>,
+    handle: JoinHandle<()>,
 }
 
 /// 公開API！
@@ -94,7 +94,6 @@ impl AprsWorker {
     ) -> Result<(
         BufReader<OwnedReadHalf>,
         Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
-        mpsc::Sender<AprsData>,
     )> {
         let stream = TcpStream::connect(host).await?;
         stream.set_nodelay(true)?;
@@ -122,9 +121,8 @@ impl AprsWorker {
         let n = reader.read_line(&mut buf).await?;
         if n > 0 && (buf.contains("verified") || password == "-1") {
             info!("login response {}", buf);
-            let (tx, _rx) = mpsc::channel(32); // _rxは使わない
             let writer = Arc::new(Mutex::new(writer));
-            return Ok((reader, writer, tx));
+            return Ok((reader, writer));
         }
         bail!("login error")
     }
@@ -213,7 +211,7 @@ impl AprsWorker {
                                             let _ = Self::send_ack_inner(writer, sender, &from, id)
                                                 .await;
                                         }
-                                        let packet = AprsData::AprsMesasge {
+                                        let packet = AprsData::AprsMessage {
                                             callsign,
                                             addressee,
                                             message,
@@ -262,6 +260,7 @@ impl AprsWorker {
         writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         buf: String,
     ) -> Result<()> {
+        tracing::debug!("send_all_inner: buf = {}", buf);
         let buf = buf.trim_end_matches(&['\r', '\n'][..]).to_string() + "\r\n";
         let mut w = writer.lock().await;
         w.write_all(buf.as_bytes()).await?;
@@ -310,8 +309,8 @@ impl AprsWorker {
         acknum: &Arc<Mutex<i32>>,
         ackpool: &Arc<Mutex<Vec<MsgHist>>>,
     ) -> Result<i32> {
-        let mut ackpool = ackpool.lock().await;
         let mut acknum = acknum.lock().await;
+        let mut ackpool = ackpool.lock().await;
 
         let now = SystemTime::now();
         let since = now - Duration::new(15 * 60, 0);
@@ -349,7 +348,7 @@ impl AprsWorker {
                 }
             );
 
-            let mut wait_time = 10;
+            let mut wait_time = 7;
             let ack = Self::new_ack_inner(acknum, ackpool).await?;
 
             for _ in 0..2 {
@@ -373,11 +372,20 @@ impl AprsWorker {
     async fn reconnect_loop(worker: Arc<Mutex<AprsWorker>>, external_tx: mpsc::Sender<AprsData>) {
         loop {
             // ワーカーがアクティブかチェック
-            {
-                let _worker_guard = worker.lock().await;
-                // ここで状態チェックとか
+            let should_reconnect = {
+                let worker_guard = worker.lock().await;
+                worker_guard.handle.is_finished() // awaitしない！is_finishedでチェックするだけ
+            };
+
+            // 実行中なら再接続しない
+            if !should_reconnect {
+                // スレッドまだ生きてる！再接続要らないよ
+                tracing::debug!("Worker thread still running, no need to reconnect");
+                tokio::time::sleep(Duration::from_secs(60)).await; // チェック間隔
+                continue;
             }
 
+            tracing::info!("Reconnecting...");
             // 再接続待機
             tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -394,7 +402,7 @@ impl AprsWorker {
             }
 
             match Self::login(&host, &callsign, &password).await {
-                Ok((new_reader, new_writer, _tx)) => {
+                Ok((new_reader, new_writer)) => {
                     // 成功したら状態更新
                     let worker_guard = worker.lock().await;
                     let mut state_guard = worker_guard.state.lock().await;
@@ -438,7 +446,7 @@ impl AprsIS {
         let rx = Arc::new(Mutex::new(rx)); // ← ここでラップ！
 
         // ログイン処理
-        let (reader, writer, _) = AprsWorker::login(host, callsign, password).await?;
+        let (reader, writer) = AprsWorker::login(host, callsign, password).await?;
 
         // 状態作成
         let state = Arc::new(Mutex::new(AprsWorkerState {
@@ -449,22 +457,20 @@ impl AprsIS {
         }));
 
         // 初期run_loop起動
-        let state_clone = state.clone();
         let sender_clone = callsign.to_string();
         let tx_clone = tx.clone();
+        let ackpool_clone = {
+            let state_guard = state.lock().await;
+            state_guard.ackpool.clone()
+        };
 
         let worker_handle = tokio::spawn(async move {
-            let res = AprsWorker::run_loop(
-                &sender_clone,
-                reader,
-                &writer,
-                &state_clone.lock().await.ackpool,
-                tx_clone,
-            )
-            .await;
+            let res =
+                AprsWorker::run_loop(&sender_clone, reader, &writer, &ackpool_clone, tx_clone)
+                    .await;
 
             if let Err(e) = res {
-                error!("Run loop exited with error: {:?}", e);
+                tracing::error!("APRS run loop exited with error: {:?}", e);
             }
         });
 
@@ -474,7 +480,7 @@ impl AprsIS {
             callsign: callsign.to_string(),
             password: password.to_string(),
             state,
-            _handle: worker_handle,
+            handle: worker_handle,
         };
 
         let worker_arc = Arc::new(Mutex::new(worker));
@@ -521,7 +527,6 @@ impl AprsIS {
     // メッセージ送信
     pub async fn write_message(&self, addressee: &AprsCallsign, messages: &str) -> Result<()> {
         let addressee_str: String = addressee.into();
-
         // 必要な状態を取得して早めにロック解放
         let (sender, writer, ackpool, acknum) = {
             let worker_guard = self.worker.lock().await;
@@ -537,7 +542,6 @@ impl AprsIS {
         // データのコピー
         let messages_clone = messages.to_string();
         let addressee_clone = addressee_str.clone();
-
         // 送信処理を別タスクで実行
         tokio::spawn(async move {
             if let Err(e) = AprsWorker::write_message_inner(
@@ -594,12 +598,12 @@ mod tests {
             if let Ok(packet) = server.read_packet().await {
                 tracing::info!("packet = {:?}", packet);
                 match packet {
-                    AprsData::AprsMesasge {
+                    AprsData::AprsMessage {
                         callsign,
                         addressee,
                         message,
                     } => {
-                        let addressee: AprsCallsign = AprsCallsign::from(&addressee);
+                        let addressee: AprsCallsign = AprsCallsign::from(addressee);
                         tracing::info!(
                             "message from {:?} to {:?} = {}",
                             callsign,
@@ -607,7 +611,10 @@ mod tests {
                             message
                         );
                         let _ = server
-                            .write_message(&callsign, &format!("reply={}\nLine2\nLine3", message))
+                            .write_message(
+                                &callsign,
+                                &format!("reply={}\n{}2\n{}3", message, message, message),
+                            )
                             .await;
                     }
                     _ => {}
