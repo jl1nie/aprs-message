@@ -403,19 +403,22 @@ impl AprsWorker {
 
             match Self::login(&host, &callsign, &password).await {
                 Ok((new_reader, new_writer)) => {
-                    // 成功したら状態更新
-                    let worker_guard = worker.lock().await;
-                    let mut state_guard = worker_guard.state.lock().await;
-
-                    // 新しいwriterで更新
-                    state_guard.writer = new_writer.clone();
-
-                    // ackpoolなどはそのまま再利用
-                    let ackpool_clone = state_guard.ackpool.clone();
+                    // 必要なデータだけ先に取り出す
+                    let ackpool_clone;
                     let sender_clone = callsign.clone();
 
-                    // run_loopで新しいreaderの読み込みを開始（外部チャネルにそのまま送信）
-                    tokio::spawn(async move {
+                    {
+                        let worker_guard = worker.lock().await;
+                        let mut state_guard = worker_guard.state.lock().await;
+
+                        // 新しいwriterで更新
+                        state_guard.writer = new_writer.clone();
+
+                        // ackpoolはコピーだけ取得
+                        ackpool_clone = state_guard.ackpool.clone();
+                    }
+
+                    let new_handle = tokio::spawn(async move {
                         let _ = Self::run_loop(
                             &sender_clone,
                             new_reader,
@@ -425,6 +428,9 @@ impl AprsWorker {
                         )
                         .await;
                     });
+
+                    let mut worker_guard = worker.lock().await;
+                    worker_guard.handle = new_handle;
 
                     info!("Successfully reconnected!");
                     break; // 再接続成功したらループ終了
