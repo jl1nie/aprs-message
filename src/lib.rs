@@ -150,13 +150,15 @@ impl AprsWorker {
         let re_ack = Regex::new(r"ack(\d+)").unwrap();
 
         loop {
-            let mut buf = String::new();
-            match reader.read_line(&mut buf).await {
-                Ok(n) if n > 0 && buf.starts_with("#") => {
-                    info!("APRS-IS server: {}", buf.trim_end());
+            let mut raw = Vec::new();
+            match reader.read_until(b'\n', &mut raw).await {
+                Ok(n) if n > 0 && raw.first() == Some(&b'#') => {
+                    let buf = String::from_utf8_lossy(&raw);
+                    tracing::debug!("APRS-IS server: {}", buf.trim_end());
                 }
-                Ok(n) if n > 0 && !buf.starts_with("#") => {
-                    buf = buf.trim_end_matches("\r\n").to_string();
+                Ok(_n) if !raw.is_empty() => {
+                    let buf = String::from_utf8_lossy(&raw);
+                    let buf = buf.trim_end_matches("\r\n").to_string();
                     tracing::debug!("raw packet: {}", buf);
                     match aprs_parser::AprsPacket::decode_textual(buf.as_bytes()) {
                         Ok(aprs_parser::AprsPacket { from, data, .. }) => {
