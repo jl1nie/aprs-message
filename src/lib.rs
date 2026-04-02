@@ -104,11 +104,16 @@ impl AprsWorker {
 
         let mut buf = String::new();
         let n = reader.read_line(&mut buf).await?;
-        info!("connect to {} read {} bytes {:?}", host, n, buf);
         if n == 0 || !buf.starts_with("#") {
             bail!("Invalid banner from server")
         }
-        info!("succesfully connected");
+        // バナーからサーバーバージョンを抽出して表示
+        // 例: "# aprsc 2.1.20-gdaa359f\r\n"
+        let banner = buf.trim_end();
+        let server_version = banner
+            .strip_prefix("# ")
+            .unwrap_or(banner);
+        info!("APRS-IS connected to {} | server: {}", host, server_version);
 
         let login_str = format!(
             "user {} pass {} vers aprs_inet 0.0_1\r\n",
@@ -120,7 +125,14 @@ impl AprsWorker {
         buf.clear();
         let n = reader.read_line(&mut buf).await?;
         if n > 0 && (buf.contains("verified") || password == "-1") {
-            info!("login response {}", buf);
+            // ログイン応答からサーバー名を抽出して表示
+            // 例: "# logresp JL1NIE-9 verified, server T2HAKATA\r\n"
+            let resp = buf.trim_end();
+            let assigned_server = resp
+                .split(", server ")
+                .nth(1)
+                .unwrap_or("unknown");
+            info!("APRS-IS login OK | callsign: {} | assigned server: {}", callsign, assigned_server);
             let writer = Arc::new(Mutex::new(writer));
             return Ok((reader, writer));
         }
@@ -140,8 +152,12 @@ impl AprsWorker {
         loop {
             let mut buf = String::new();
             match reader.read_line(&mut buf).await {
+                Ok(n) if n > 0 && buf.starts_with("#") => {
+                    info!("APRS-IS server: {}", buf.trim_end());
+                }
                 Ok(n) if n > 0 && !buf.starts_with("#") => {
                     buf = buf.trim_end_matches("\r\n").to_string();
+                    tracing::debug!("raw packet: {}", buf);
                     match aprs_parser::AprsPacket::decode_textual(buf.as_bytes()) {
                         Ok(aprs_parser::AprsPacket { from, data, .. }) => {
                             let mut cs = from.call().to_string();
