@@ -69,6 +69,27 @@ struct AprsWorkerState {
     sender: String,
 }
 
+/// 接続の監視と再接続の間隔
+#[derive(Debug, Clone, Copy)]
+struct Timing {
+    /// この時間なにも受信しなければ、接続が死んだとみなす(APRS-IS は 20 秒ごとに "#" の行を送る)
+    idle_timeout: Duration,
+    /// 受信ループが終わっていないかを見る間隔
+    check_interval: Duration,
+    /// 再接続の前に待つ時間
+    reconnect_delay: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Timing {
+            idle_timeout: Duration::from_secs(120),
+            check_interval: Duration::from_secs(10),
+            reconnect_delay: Duration::from_secs(5),
+        }
+    }
+}
+
 /// 接続状態を管理するワーカー
 struct AprsWorker {
     host: String,
@@ -76,6 +97,9 @@ struct AprsWorker {
     password: String,
     state: Arc<Mutex<AprsWorkerState>>,
     handle: JoinHandle<()>,
+    /// 最後に設定したフィルター。再接続したら送り直す
+    filter: Option<String>,
+    timing: Timing,
 }
 
 /// 公開API！
@@ -146,12 +170,25 @@ impl AprsWorker {
         writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
         ackpool: &Arc<Mutex<Vec<MsgHist>>>,
         tx: mpsc::Sender<AprsData>, // 外部送信用チャネル
+        idle_timeout: Duration,
     ) -> Result<()> {
         let re_ack = Regex::new(r"ack(\d+)").unwrap();
 
         loop {
             let mut raw = Vec::new();
-            match reader.read_until(b'\n', &mut raw).await {
+            let read = match tokio::time::timeout(idle_timeout, reader.read_until(b'\n', &mut raw)).await {
+                Ok(read) => read,
+                Err(_) => {
+                    error!("No data from APRS-IS for {:?}; treating the connection as dead", idle_timeout);
+                    bail!("APRS-IS connection idle for {:?}", idle_timeout);
+                }
+            };
+            match read {
+                // 相手が接続を閉じた。読み直してもすぐ 0 が返るだけなので、抜けて再接続させる
+                Ok(0) => {
+                    error!("Connection closed by APRS-IS server");
+                    bail!("APRS-IS connection closed by server");
+                }
                 Ok(n) if n > 0 && raw.first() == Some(&b'#') => {
                     let buf = String::from_utf8_lossy(&raw);
                     tracing::debug!("APRS-IS server: {}", buf.trim_end());
@@ -248,15 +285,14 @@ impl AprsWorker {
                     }
                 }
                 Ok(_) => {}
-                Err(e) => match e.kind() {
-                    ErrorKind::ConnectionReset | ErrorKind::BrokenPipe => {
-                        error!("Connection lost: {:?}", e);
-                        return Err(e.into());
+                // 読み込みのエラーはどれも接続の異常として抜け、再接続させる(続けると空回りすることがある)
+                Err(e) => {
+                    match e.kind() {
+                        ErrorKind::ConnectionReset | ErrorKind::BrokenPipe => error!("Connection lost: {:?}", e),
+                        _ => warn!("Unexpected read error: {:?}", e),
                     }
-                    _ => {
-                        warn!("Unexpected read error: {:?}", e);
-                    }
-                },
+                    return Err(e.into());
+                }
             }
         }
     }
@@ -387,40 +423,49 @@ impl AprsWorker {
     }
 
     // 再接続ロジック！
+    // 受信ループが終わるたびに再接続する(何度でも)
     async fn reconnect_loop(worker: Arc<Mutex<AprsWorker>>, external_tx: mpsc::Sender<AprsData>) {
         loop {
             // ワーカーがアクティブかチェック
-            let should_reconnect = {
+            let (should_reconnect, timing) = {
                 let worker_guard = worker.lock().await;
-                worker_guard.handle.is_finished() // awaitしない！is_finishedでチェックするだけ
+                (worker_guard.handle.is_finished(), worker_guard.timing) // awaitしない！is_finishedでチェックするだけ
             };
 
             // 実行中なら再接続しない
             if !should_reconnect {
-                // スレッドまだ生きてる！再接続要らないよ
                 tracing::debug!("Worker thread still running, no need to reconnect");
-                tokio::time::sleep(Duration::from_secs(60)).await; // チェック間隔
+                tokio::time::sleep(timing.check_interval).await;
                 continue;
             }
 
             tracing::info!("Reconnecting...");
             // 再接続待機
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(timing.reconnect_delay).await;
 
             // 再接続試行
             let host;
             let callsign;
             let password;
+            let filter;
 
             {
                 let w = worker.lock().await;
                 host = w.host.clone();
                 callsign = w.callsign.clone();
                 password = w.password.clone();
+                filter = w.filter.clone();
             }
 
             match Self::login(&host, &callsign, &password).await {
                 Ok((new_reader, new_writer)) => {
+                    // 新しい接続にはフィルターがないので、設定してあったものを送り直す
+                    if let Some(f) = &filter {
+                        if let Err(e) = Self::send_all_inner(&new_writer, format!("#filter {}", f)).await {
+                            error!("Failed to restore filter after reconnect: {:?}", e);
+                            continue;
+                        }
+                    }
                     // 必要なデータだけ先に取り出す
                     let ackpool_clone;
                     let sender_clone = callsign.clone();
@@ -436,22 +481,27 @@ impl AprsWorker {
                         ackpool_clone = state_guard.ackpool.clone();
                     }
 
+                    let tx = external_tx.clone();
                     let new_handle = tokio::spawn(async move {
-                        let _ = Self::run_loop(
+                        if let Err(e) = Self::run_loop(
                             &sender_clone,
                             new_reader,
                             &new_writer,
                             &ackpool_clone,
-                            external_tx,
+                            tx,
+                            timing.idle_timeout,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::error!("APRS run loop exited with error: {:?}", e);
+                        }
                     });
 
                     let mut worker_guard = worker.lock().await;
                     worker_guard.handle = new_handle;
 
                     info!("Successfully reconnected!");
-                    break; // 再接続成功したらループ終了
+                    // ループは続ける。次に切れたときも再接続する
                 }
                 Err(e) => {
                     error!("Reconnection failed: {:?}", e);
@@ -465,6 +515,10 @@ impl AprsWorker {
 impl AprsIS {
     // 外部API: connect
     pub async fn connect(host: &str, callsign: &str, password: &str) -> Result<Self> {
+        Self::connect_with(host, callsign, password, Timing::default()).await
+    }
+
+    async fn connect_with(host: &str, callsign: &str, password: &str, timing: Timing) -> Result<Self> {
         // 外部へのデータ送信用チャネル作成
         let (tx, rx) = mpsc::channel(32);
         let rx = Arc::new(Mutex::new(rx)); // ← ここでラップ！
@@ -489,9 +543,15 @@ impl AprsIS {
         };
 
         let worker_handle = tokio::spawn(async move {
-            let res =
-                AprsWorker::run_loop(&sender_clone, reader, &writer, &ackpool_clone, tx_clone)
-                    .await;
+            let res = AprsWorker::run_loop(
+                &sender_clone,
+                reader,
+                &writer,
+                &ackpool_clone,
+                tx_clone,
+                timing.idle_timeout,
+            )
+            .await;
 
             if let Err(e) = res {
                 tracing::error!("APRS run loop exited with error: {:?}", e);
@@ -505,6 +565,8 @@ impl AprsIS {
             password: password.to_string(),
             state,
             handle: worker_handle,
+            filter: None,
+            timing,
         };
 
         let worker_arc = Arc::new(Mutex::new(worker));
@@ -541,7 +603,8 @@ impl AprsIS {
 
     // フィルター設定
     pub async fn set_filter(&self, filter: String) -> Result<()> {
-        let worker_guard = self.worker.lock().await;
+        let mut worker_guard = self.worker.lock().await;
+        worker_guard.filter = Some(filter.clone());
         let state_guard = worker_guard.state.lock().await;
         let cmd = format!("#filter {}", filter);
         AprsWorker::send_all_inner(&state_guard.writer, cmd).await?;
@@ -590,6 +653,103 @@ impl AprsIS {
 mod tests {
     use super::*;
     use std::env;
+    use tokio::net::TcpListener;
+
+    /// 偽の APRS-IS。ログインに答え、hold だけ受信した行を記録してから接続を閉じる。接続ごとの受信行を返す
+    async fn fake_server(hold: Duration) -> (String, Arc<Mutex<Vec<Vec<String>>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conns: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let c = conns.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (rh, mut wh) = stream.into_split();
+                let mut reader = BufReader::new(rh);
+                wh.write_all(b"# fake 1.0\r\n").await.unwrap();
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                wh.write_all(b"# logresp TEST verified, server FAKE\r\n").await.unwrap();
+                let idx = {
+                    let mut g = c.lock().await;
+                    g.push(vec![line.trim_end().to_string()]);
+                    g.len() - 1
+                };
+                let deadline = tokio::time::Instant::now() + hold;
+                loop {
+                    let mut l = String::new();
+                    match tokio::time::timeout_at(deadline, reader.read_line(&mut l)).await {
+                        Ok(Ok(n)) if n > 0 => c.lock().await[idx].push(l.trim_end().to_string()),
+                        _ => break,
+                    }
+                }
+                // ここで rh・wh が落ちて接続が閉じる
+            }
+        });
+        (addr, conns)
+    }
+
+    async fn connected_pair() -> (BufReader<OwnedReadHalf>, Arc<Mutex<BufWriter<OwnedWriteHalf>>>, tokio::net::TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (rh, wh) = client.into_split();
+        (BufReader::new(rh), Arc::new(Mutex::new(BufWriter::new(wh))), server)
+    }
+
+    #[tokio::test]
+    async fn run_loop_returns_when_server_closes() {
+        // 以前は Ok(0) を無視して読み直し続け、CPU を使い切ったまま再接続もしなかった
+        let (reader, writer, server) = connected_pair().await;
+        drop(server);
+        let (tx, _rx) = mpsc::channel(4);
+        let ackpool = Arc::new(Mutex::new(Vec::new()));
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            AprsWorker::run_loop("TEST", reader, &writer, &ackpool, tx, Duration::from_secs(60)),
+        )
+        .await
+        .expect("run_loop did not return after the server closed the connection");
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_loop_returns_when_idle() {
+        let (reader, writer, _server) = connected_pair().await; // 開いたまま何も送らない
+        let (tx, _rx) = mpsc::channel(4);
+        let ackpool = Arc::new(Mutex::new(Vec::new()));
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            AprsWorker::run_loop("TEST", reader, &writer, &ackpool, tx, Duration::from_millis(200)),
+        )
+        .await
+        .expect("run_loop did not time out on an idle connection");
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn reconnects_every_time_and_restores_filter() {
+        // 以前は 1 回再接続すると監視をやめ、2 回目の切断から復帰しなかった
+        let (addr, conns) = fake_server(Duration::from_millis(300)).await;
+        let timing = Timing {
+            idle_timeout: Duration::from_secs(5),
+            check_interval: Duration::from_millis(50),
+            reconnect_delay: Duration::from_millis(50),
+        };
+        let aprs = AprsIS::connect_with(&addr, "TEST", "-1", timing).await.unwrap();
+        aprs.set_filter("r/36/137/1500 t/p/m".to_string()).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while conns.lock().await.len() < 4 {
+            assert!(tokio::time::Instant::now() < deadline, "only {} connections", conns.lock().await.len());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let g = conns.lock().await;
+        for (i, lines) in g.iter().enumerate().take(4) {
+            assert!(lines[0].starts_with("user TEST pass -1"), "{:?}", lines);
+            assert!(lines.iter().any(|l| l == "#filter r/36/137/1500 t/p/m"), "connection {} did not get the filter: {:?}", i, lines);
+        }
+    }
     #[tokio::test]
     async fn it_works() {
         tracing_subscriber::fmt()
